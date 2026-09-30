@@ -53,6 +53,11 @@ class RecognitionService:
                     Siswa,
                     FaceEmbedding.siswa_id == Siswa.id
                 )
+                .filter(Siswa.status == "AKTIF")
+                # ^ siswa nonaktif (mis. sudah lulus) TETAP punya baris
+                # FaceEmbedding di database (tidak dihapus), tapi TIDAK
+                # ikut dimuat ke memori -- jadi tidak akan pernah lagi
+                # cocok/terdeteksi saat scan kamera.
                 .all()
             )
 

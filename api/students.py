@@ -1,13 +1,20 @@
 """
 api/students.py
-CRUD /students + POST /students/{id}/migrate -- dipanggil Kelas.jsx.
+CRUD /students + POST /students/{id}/migrate + POST /students/assign-bulk
+-- dipanggil Kelas.jsx.
+
+Proteksi role:
+  GET (lihat)                              -> admin, operator, walas (walas cuma lihat kelasnya sendiri)
+  POST/PUT/DELETE/migrate/assign-bulk      -> admin saja
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 
 from database.session import SessionLocal
 from database.models import Siswa, Kelas
+from api.grade_utils import tingkat_ke_grade
+from auth import require_role
 
 router = APIRouter()
 
@@ -29,6 +36,11 @@ class AssignBulkIn(BaseModel):
     student_ids: list[str]
 
 
+class BulkStatusIn(BaseModel):
+    class_id: str
+    status: str  # "AKTIF" atau "NONAKTIF"
+
+
 def _serialize(siswa: Siswa, kelas: Kelas | None = None) -> dict:
     kelas = kelas or siswa.kelas
     return {
@@ -38,20 +50,38 @@ def _serialize(siswa: Siswa, kelas: Kelas | None = None) -> dict:
         "gender": siswa.jenis_kelamin or "L",
         "class_id": str(siswa.kelas_id),
         "class_name": kelas.nama if kelas else "",
-        "grade": kelas.tingkat if kelas else "",
+        "grade": tingkat_ke_grade(kelas.tingkat) if kelas else "",
         "status": siswa.status,
     }
 
 
 @router.get("")
-def list_students(class_id: str | None = None, q: str | None = None):
+def list_students(
+    class_id: str | None = None,
+    q: str | None = None,
+    status: str | None = "AKTIF",
+    # ^ default cuma tampilkan yang AKTIF (angkatan yang sudah lulus/
+    # dinonaktifkan otomatis tersembunyi dari frontend). Kirim
+    # status=NONAKTIF untuk lihat alumni, atau status=semua untuk lihat semuanya.
+    user: dict = Depends(require_role("admin", "operator", "walas")),
+):
     db = SessionLocal()
     try:
         query = db.query(Siswa)
-        if class_id:
+
+        if user["role"] == "walas":
+            # walas cuma boleh lihat siswa di kelasnya, apapun class_id
+            # yang diminta di query param -- dipaksa timpa.
+            query = query.filter(Siswa.kelas_id == user["kelas_id"])
+        elif class_id:
             query = query.filter(Siswa.kelas_id == int(class_id))
+
+        if status and status.lower() != "semua":
+            query = query.filter(Siswa.status == status)
+
         if q:
             query = query.filter(Siswa.nama.ilike(f"%{q}%"))
+
         siswa_list = query.order_by(Siswa.nama).all()
         return [_serialize(s) for s in siswa_list]
     finally:
@@ -59,7 +89,7 @@ def list_students(class_id: str | None = None, q: str | None = None):
 
 
 @router.post("")
-def create_student(data: StudentIn):
+def create_student(data: StudentIn, user: dict = Depends(require_role("admin"))):
     db = SessionLocal()
     try:
         kelas = db.query(Kelas).filter(Kelas.id == int(data.class_id)).first()
@@ -85,7 +115,7 @@ def create_student(data: StudentIn):
 
 
 @router.post("/assign-bulk")
-def assign_students_bulk(data: AssignBulkIn):
+def assign_students_bulk(data: AssignBulkIn, user: dict = Depends(require_role("admin"))):
     """
     Masukkan banyak siswa YANG SUDAH TERDAFTAR ke satu kelas sekaligus
     (dipakai Kelas.jsx saat admin pilih dari daftar siswa existing,
@@ -110,8 +140,43 @@ def assign_students_bulk(data: AssignBulkIn):
         db.close()
 
 
+@router.post("/bulk-status")
+def bulk_status(data: BulkStatusIn, request: Request, user: dict = Depends(require_role("admin"))):
+    """
+    Ubah status SEMUA siswa dalam satu kelas sekaligus -- dipakai saat
+    angkatan lulus (nonaktifkan) atau kalau perlu diaktifkan lagi.
+
+    Embedding wajah & data siswa TIDAK dihapus -- cuma disembunyikan
+    dari listing (status != AKTIF) dan dari recognition (RecognitionService
+    hanya load embedding siswa AKTIF).
+    """
+    if data.status not in ("AKTIF", "NONAKTIF"):
+        raise HTTPException(400, "status harus AKTIF atau NONAKTIF")
+
+    db = SessionLocal()
+    try:
+        kelas = db.query(Kelas).filter(Kelas.id == int(data.class_id)).first()
+        if kelas is None:
+            raise HTTPException(404, "Kelas tidak ditemukan")
+
+        jumlah = (
+            db.query(Siswa)
+            .filter(Siswa.kelas_id == kelas.id)
+            .update({"status": data.status}, synchronize_session=False)
+        )
+        db.commit()
+
+        # reload cache recognition supaya efeknya langsung terasa saat
+        # scan berikutnya, tanpa perlu restart server
+        request.app.state.recognition.reload_embeddings()
+
+        return {"ok": True, "jumlah": jumlah, "class_id": str(kelas.id), "status": data.status}
+    finally:
+        db.close()
+
+
 @router.put("/{student_id}")
-def update_student(student_id: int, data: StudentIn):
+def update_student(student_id: int, data: StudentIn, request: Request, user: dict = Depends(require_role("admin"))):
     db = SessionLocal()
     try:
         kelas = db.query(Kelas).filter(Kelas.id == int(data.class_id)).first()
@@ -122,6 +187,8 @@ def update_student(student_id: int, data: StudentIn):
         if siswa is None:
             raise HTTPException(404, "Siswa tidak ditemukan")
 
+        status_berubah = siswa.status != data.status
+
         siswa.nis = data.nisn or None
         siswa.nama = data.name
         siswa.kelas_id = kelas.id
@@ -129,13 +196,17 @@ def update_student(student_id: int, data: StudentIn):
         siswa.status = data.status
         db.commit()
         db.refresh(siswa)
+
+        if status_berubah:
+            request.app.state.recognition.reload_embeddings()
+
         return _serialize(siswa, kelas)
     finally:
         db.close()
 
 
 @router.delete("/{student_id}")
-def delete_student(student_id: int):
+def delete_student(student_id: int, user: dict = Depends(require_role("admin"))):
     db = SessionLocal()
     try:
         siswa = db.query(Siswa).filter(Siswa.id == student_id).first()
@@ -149,7 +220,7 @@ def delete_student(student_id: int):
 
 
 @router.post("/{student_id}/migrate")
-def migrate_student(student_id: int, data: MigrateIn):
+def migrate_student(student_id: int, data: MigrateIn, user: dict = Depends(require_role("admin"))):
     db = SessionLocal()
     try:
         kelas = db.query(Kelas).filter(Kelas.id == int(data.class_id)).first()
