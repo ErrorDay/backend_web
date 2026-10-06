@@ -1,11 +1,12 @@
 """
 api/students.py
 CRUD /students + POST /students/{id}/migrate + POST /students/assign-bulk
--- dipanggil Kelas.jsx.
++ POST /students/bulk-status + POST /students/bulk-status-angkatan
++ POST /students/set-angkatan -- dipanggil Kelas.jsx & Siswa.jsx.
 
 Proteksi role:
   GET (lihat)                              -> admin, operator, walas (walas cuma lihat kelasnya sendiri)
-  POST/PUT/DELETE/migrate/assign-bulk      -> admin saja
+  POST/PUT/DELETE/migrate/assign-bulk/dll  -> admin saja
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Request
@@ -25,6 +26,7 @@ class StudentIn(BaseModel):
     gender: str = "L"
     class_id: str
     status: str = "AKTIF"
+    angkatan: str | None = None
 
 
 class MigrateIn(BaseModel):
@@ -41,6 +43,16 @@ class BulkStatusIn(BaseModel):
     status: str  # "AKTIF" atau "NONAKTIF"
 
 
+class BulkStatusAngkatanIn(BaseModel):
+    angkatan: str
+    status: str  # "AKTIF" atau "NONAKTIF"
+
+
+class SetAngkatanIn(BaseModel):
+    class_id: str
+    angkatan: str
+
+
 def _serialize(siswa: Siswa, kelas: Kelas | None = None) -> dict:
     kelas = kelas or siswa.kelas
     return {
@@ -52,12 +64,14 @@ def _serialize(siswa: Siswa, kelas: Kelas | None = None) -> dict:
         "class_name": kelas.nama if kelas else "",
         "grade": tingkat_ke_grade(kelas.tingkat) if kelas else "",
         "status": siswa.status,
+        "angkatan": siswa.angkatan or "",
     }
 
 
 @router.get("")
 def list_students(
     class_id: str | None = None,
+    angkatan: str | None = None,
     q: str | None = None,
     status: str | None = "AKTIF",
     # ^ default cuma tampilkan yang AKTIF (angkatan yang sudah lulus/
@@ -75,6 +89,9 @@ def list_students(
             query = query.filter(Siswa.kelas_id == user["kelas_id"])
         elif class_id:
             query = query.filter(Siswa.kelas_id == int(class_id))
+
+        if angkatan:
+            query = query.filter(Siswa.angkatan == angkatan)
 
         if status and status.lower() != "semua":
             query = query.filter(Siswa.status == status)
@@ -105,6 +122,7 @@ def create_student(data: StudentIn, user: dict = Depends(require_role("admin")))
             kelas_id=kelas.id,
             jenis_kelamin=data.gender,
             status=data.status,
+            angkatan=data.angkatan or None,
         )
         db.add(siswa)
         db.commit()
@@ -140,15 +158,38 @@ def assign_students_bulk(data: AssignBulkIn, user: dict = Depends(require_role("
         db.close()
 
 
+@router.post("/set-angkatan")
+def set_angkatan(data: SetAngkatanIn, user: dict = Depends(require_role("admin"))):
+    """
+    Tandai SEMUA siswa dalam satu kelas dengan angkatan tertentu sekaligus
+    -- dipakai sekali per kelas (mis. setelah seeding kelas baru), karena
+    angkatan tidak lagi dibaca dari struktur folder dataset/ (yang tetap
+    per kelas/jurusan seperti biasa).
+    """
+    db = SessionLocal()
+    try:
+        kelas = db.query(Kelas).filter(Kelas.id == int(data.class_id)).first()
+        if kelas is None:
+            raise HTTPException(404, "Kelas tidak ditemukan")
+
+        jumlah = (
+            db.query(Siswa)
+            .filter(Siswa.kelas_id == kelas.id)
+            .update({"angkatan": data.angkatan}, synchronize_session=False)
+        )
+        db.commit()
+
+        return {"ok": True, "jumlah": jumlah, "class_id": str(kelas.id), "angkatan": data.angkatan}
+    finally:
+        db.close()
+
+
 @router.post("/bulk-status")
 def bulk_status(data: BulkStatusIn, request: Request, user: dict = Depends(require_role("admin"))):
     """
-    Ubah status SEMUA siswa dalam satu kelas sekaligus -- dipakai saat
-    angkatan lulus (nonaktifkan) atau kalau perlu diaktifkan lagi.
-
-    Embedding wajah & data siswa TIDAK dihapus -- cuma disembunyikan
-    dari listing (status != AKTIF) dan dari recognition (RecognitionService
-    hanya load embedding siswa AKTIF).
+    Ubah status SEMUA siswa dalam satu KELAS sekaligus.
+    Untuk nonaktifkan berdasarkan ANGKATAN (lintas kelas), pakai
+    /students/bulk-status-angkatan sebagai gantinya.
     """
     if data.status not in ("AKTIF", "NONAKTIF"):
         raise HTTPException(400, "status harus AKTIF atau NONAKTIF")
@@ -166,11 +207,39 @@ def bulk_status(data: BulkStatusIn, request: Request, user: dict = Depends(requi
         )
         db.commit()
 
-        # reload cache recognition supaya efeknya langsung terasa saat
-        # scan berikutnya, tanpa perlu restart server
         request.app.state.recognition.reload_embeddings()
 
         return {"ok": True, "jumlah": jumlah, "class_id": str(kelas.id), "status": data.status}
+    finally:
+        db.close()
+
+
+@router.post("/bulk-status-angkatan")
+def bulk_status_angkatan(data: BulkStatusAngkatanIn, request: Request, user: dict = Depends(require_role("admin"))):
+    """
+    Ubah status SEMUA siswa dalam satu ANGKATAN sekaligus -- dipakai saat
+    angkatan lulus, TIDAK PEDULI mereka sekarang tersebar di kelas mana
+    (termasuk yang sudah di-reshuffle/migrasi kelas). Ini alasan utama
+    kolom angkatan dipisah dari kelas_id.
+
+    Embedding wajah & data siswa TIDAK dihapus -- cuma disembunyikan
+    dari listing (status != AKTIF) dan dari recognition.
+    """
+    if data.status not in ("AKTIF", "NONAKTIF"):
+        raise HTTPException(400, "status harus AKTIF atau NONAKTIF")
+
+    db = SessionLocal()
+    try:
+        jumlah = (
+            db.query(Siswa)
+            .filter(Siswa.angkatan == data.angkatan)
+            .update({"status": data.status}, synchronize_session=False)
+        )
+        db.commit()
+
+        request.app.state.recognition.reload_embeddings()
+
+        return {"ok": True, "jumlah": jumlah, "angkatan": data.angkatan, "status": data.status}
     finally:
         db.close()
 
@@ -194,6 +263,7 @@ def update_student(student_id: int, data: StudentIn, request: Request, user: dic
         siswa.kelas_id = kelas.id
         siswa.jenis_kelamin = data.gender
         siswa.status = data.status
+        siswa.angkatan = data.angkatan or None
         db.commit()
         db.refresh(siswa)
 

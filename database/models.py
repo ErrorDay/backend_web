@@ -128,6 +128,15 @@ class Siswa(Base):
         default="AKTIF"
     )
 
+    angkatan: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True
+    )
+    # ^ Independen dari kelas_id -- angkatan (kohort masuk, mis. "4", "5", "6")
+    # tetap sama selama 3 tahun walau siswa pindah/di-reshuffle antar kelas
+    # tiap kenaikan tingkat. Dipakai untuk "Luluskan Angkatan" (nonaktifkan
+    # semua siswa satu angkatan sekaligus, apapun kelasnya sekarang).
+
     foto: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True
@@ -249,6 +258,15 @@ class User(Base):
         String(30),
         nullable=False
     )
+
+    kelas_id: Mapped[int | None] = mapped_column(
+        ForeignKey("kelas.id"),
+        nullable=True
+        # Hanya diisi kalau role="walas" -- menentukan kelas mana yang
+        # boleh diakses/dikoreksi walas ini. NULL untuk admin/operator.
+    )
+
+    kelas = relationship("Kelas")
 
     aktif: Mapped[bool] = mapped_column(
         Boolean,
