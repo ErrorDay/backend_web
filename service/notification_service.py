@@ -5,6 +5,7 @@ import ssl
 from datetime import date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ from service.report_service import ReportService
 from modules.kontak import get_kontak_kelas
 from modules.kalender import is_hari_sekolah
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 JAM_CUTOFF = 7
 MENIT_CUTOFF = 30
