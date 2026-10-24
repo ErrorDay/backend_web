@@ -105,7 +105,21 @@ class AttendanceService:
         Dipanggil saat siswa scan wajah -- status dihitung otomatis
         (Tidak Terlambat / Terlambat). Setara dengan alur lama
         process_attendance(), tapi tanpa konsep check-out.
+
+        Deteksi hanya membuat absensi pertama pada tanggal tersebut.
+        Perubahan absensi yang sudah ada harus dilakukan secara manual.
         """
+        existing = (
+            self.db.query(Absensi)
+            .filter(
+                Absensi.siswa_id == siswa.id,
+                Absensi.tanggal == date.today(),
+            )
+            .first()
+        )
+        if existing:
+            return existing, False
+
         return self.record_attendance(siswa, status=None)
 
     def check_in(self, siswa_id: int):

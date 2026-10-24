@@ -3,8 +3,8 @@ service/library_service.py
 
 Service untuk fitur baru "Kunjungan Perpustakaan" -- terpisah dari
 AttendanceService karena semantiknya beda: satu siswa BOLEH tercatat
-berkali-kali dalam satu hari (tiap kunjungan = 1 baris baru), tidak
-seperti Absensi yang cuma 1 baris/hari.
+berkali-kali dalam satu hari, tetapi hanya setelah cooldown satu jam
+sejak kunjungan terakhirnya.
 """
 
 from datetime import date, datetime, time, timedelta
@@ -15,6 +15,8 @@ from database.session import SessionLocal
 
 class LibraryService:
 
+    COOLDOWN = timedelta(hours=1)
+
     def __init__(self):
         self.db = SessionLocal()
 
@@ -23,15 +25,27 @@ class LibraryService:
         siswa: Siswa,
         tanggal: date | None = None,
         waktu: time | None = None,
-    ) -> tuple[Kunjungan, int]:
+    ) -> tuple[Kunjungan | None, int]:
         """
-        Catat 1 kunjungan baru (selalu INSERT, tidak upsert).
+        Catat kunjungan baru jika siswa tidak berkunjung dalam satu jam terakhir.
+        Return (None, 0) jika siswa masih dalam masa cooldown.
         Return: (Kunjungan, visit_ke) -- visit_ke = urutan kunjungan
         siswa ini pada hari itu (1 = kunjungan pertama hari itu, dst).
         """
         now = datetime.now()
         tanggal = tanggal or now.date()
         waktu = waktu or now.time()
+
+        last_visit = (
+            self.db.query(Kunjungan)
+            .filter(Kunjungan.siswa_id == siswa.id)
+            .order_by(Kunjungan.tanggal.desc(), Kunjungan.waktu.desc())
+            .first()
+        )
+        if last_visit:
+            last_visit_at = datetime.combine(last_visit.tanggal, last_visit.waktu)
+            if datetime.combine(tanggal, waktu) - last_visit_at < self.COOLDOWN:
+                return None, 0
 
         kunjungan = Kunjungan(siswa_id=siswa.id, tanggal=tanggal, waktu=waktu)
         self.db.add(kunjungan)

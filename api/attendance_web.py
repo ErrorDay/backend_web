@@ -150,8 +150,8 @@ def recognize(data: RecognizeIn, request: Request):
     proses FastAPI ini (RecognitionService + AntiSpoofService dari
     app.state), bukan lewat face_recognition_bridge.py terpisah.
 
-    target="attendance" (default) -> catat ke tabel Absensi (1x/hari, upsert)
-    target="library" -> catat ke tabel Kunjungan (boleh berkali-kali/hari, selalu insert baru)
+    target="attendance" (default) -> catat ke tabel Absensi (1x/hari)
+    target="library" -> catat ke tabel Kunjungan (cooldown satu jam per siswa)
     """
 
     is_library = data.target == "library"
@@ -170,6 +170,13 @@ def recognize(data: RecognizeIn, request: Request):
 
             if is_library:
                 kunjungan, visit_ke = library.record_visit(siswa)
+                if kunjungan is None:
+                    return {
+                        "recognized": True,
+                        "mode": "simulasi",
+                        "cooldown": True,
+                        "message": "Siswa baru saja berkunjung, cooldown berlaku selama satu jam.",
+                    }
                 return {
                     "recognized": True,
                     "mode": "simulasi",
@@ -196,14 +203,9 @@ def recognize(data: RecognizeIn, request: Request):
         recognizer = request.app.state.recognition
         anti_spoof = request.app.state.anti_spoof
 
-        # cooldown terpisah untuk presensi vs perpustakaan -- supaya siswa
-        # yang baru absen tetap bisa langsung discan di mode perpustakaan
-        # tanpa nunggu cooldown presensi selesai, dan sebaliknya.
-        last_scan = (
-            request.app.state.library_last_scan
-            if is_library
-            else request.app.state.attendance_last_scan
-        )
+        # Cooldown presensi singkat hanya membantu mengurangi pemrosesan
+        # berulang; batas satu kali per hari dijaga oleh AttendanceService.
+        last_scan = request.app.state.attendance_last_scan
 
         hasil = recognizer.recognize(frame)
         faces = [f for f in hasil["faces"] if f["siswa"] is not None]
@@ -225,11 +227,14 @@ def recognize(data: RecognizeIn, request: Request):
         sekarang = time.time()
 
         if is_library:
-            if nama in last_scan and sekarang - last_scan[nama] < COOLDOWN_DETIK:
-                return {"recognized": False, "message": f"{siswa.nama} baru saja tercatat, tunggu beberapa detik."}
-
             kunjungan, visit_ke = library.record_visit(siswa)
-            last_scan[nama] = sekarang
+            if kunjungan is None:
+                return {
+                    "recognized": True,
+                    "mode": "face_recognition",
+                    "cooldown": True,
+                    "message": f"{siswa.nama} baru saja berkunjung, cooldown berlaku selama satu jam.",
+                }
             return {
                 "recognized": True,
                 "mode": "face_recognition",
